@@ -8,10 +8,10 @@ import sys
 import os
 import glob
 
+
 def identify_pocket_atoms(ref_traj, cutoff=1.0):
     """Identify protein backbone pocket atoms within a given distance of the ligand.
     If ligand is not present, use all protein backbone heavy atoms."""
-    # Select protein backbone (chain A) and ligand (not protein, no H)
     protein_atoms = ref_traj.topology.select("protein and backbone and not element H")
     ligand_atoms = ref_traj.topology.select("not protein and not element H")
 
@@ -19,16 +19,13 @@ def identify_pocket_atoms(ref_traj, cutoff=1.0):
         print("❌ Error: No protein backbone atoms found in the reference PDB.")
         sys.exit(1)
 
-    # Fallback for protein-only case
     if len(ligand_atoms) == 0:
         print("⚠ Warning: No ligand found. Using protein backbone heavy atoms as pocket.")
         return protein_atoms, False
 
-    # Compute distances between protein atoms and ligand atoms
     pairs = np.array([[p, l] for p in protein_atoms for l in ligand_atoms])
     distances = md.compute_distances(ref_traj, pairs).reshape(len(protein_atoms), len(ligand_atoms))
 
-    # Identify pocket atoms (within cutoff distance)
     pocket_mask = np.any(distances < cutoff, axis=1)
     pocket_atoms = protein_atoms[pocket_mask]
 
@@ -38,12 +35,13 @@ def identify_pocket_atoms(ref_traj, cutoff=1.0):
 
     return pocket_atoms, True
 
+
 def get_matched_pocket_atoms(ref_traj, target_traj, ref_pocket_atoms):
     target_lookup = {}
     for atom in target_traj.topology.atoms:
         key = (atom.name, atom.residue.name, atom.residue.index, atom.residue.chain.index)
         if key not in target_lookup:
-            target_lookup[key] = atom.index  # Save first match only
+            target_lookup[key] = atom.index
 
     matched_target_atoms = []
     for idx in ref_pocket_atoms:
@@ -54,93 +52,146 @@ def get_matched_pocket_atoms(ref_traj, target_traj, ref_pocket_atoms):
 
     return matched_target_atoms
 
+
+def make_output_names(pdb_files, suffix):
+    """For each input file, write output in same directory with <stem><suffix>.pdb"""
+    outputs = []
+    for pdb in pdb_files:
+        d = os.path.dirname(pdb)
+        stem = os.path.splitext(os.path.basename(pdb))[0]
+        outputs.append(os.path.join(d, f"{stem}{suffix}.pdb"))
+    return outputs
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Align a PDB file to a reference using the protein backbone pocket residues (MDTraj).")
-    parser.add_argument("target", help="Target PDB file to be aligned.")
+    parser = argparse.ArgumentParser(
+        description="Align PDB file(s) to a reference using protein backbone pocket residues (MDTraj)."
+    )
+    parser.add_argument("target", help="Target PDB file(s) to be aligned (supports glob).")
     parser.add_argument("--ref", default="model.pdb", help="Reference PDB file (default: model.pdb)")
     parser.add_argument("--cutoff", type=float, default=1.0, help="Pocket cutoff distance in nm (default: 1.0)")
-    parser.add_argument("-o", "--output", default="aligned_model.pdb", help="An aligned model filename (default: aligned_model.pdb at the same input directory)")
-    parser.add_argument("--oligand", default="aligned_ligand.pdb", help="An aligned ligand filename (default: aligned_ligand.pdb at the same input directory)")
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Aligned model filename. Default: <input>_aligned.pdb (same directory as each input). "
+             "If multiple targets and a single -o is given, a multi-model PDB is written."
+    )
+    parser.add_argument(
+        "--oligand",
+        default=None,
+        help="Aligned ligand filename. Default: <input>_ligand_aligned.pdb (same directory as each input). "
+             "If multiple targets and a single --oligand is given, a multi-model PDB is written."
+    )
     args = parser.parse_args()
 
+    # --- Load reference ---
     print(f"📂 Loading reference: {args.ref}")
-    pattern = os.path.expanduser(args.ref)
-    ref_pdb_file = glob.glob(pattern)
-    ref_pdb_file = os.path.abspath(ref_pdb_file[0])
+    ref_matches = glob.glob(os.path.expanduser(args.ref))
+    if not ref_matches:
+        print(f"❌ Error: Reference not found: {args.ref}")
+        sys.exit(1)
+    ref_pdb_file = os.path.abspath(ref_matches[0])
     print(f"  - {ref_pdb_file}")
-    ref_traj = md.load(args.ref)
-    print(ref_traj)  # Print summary of the reference trajectory
+    ref_traj = md.load(ref_pdb_file)
+    print(ref_traj)
 
-    print(f"📂 Loading target: {args.target}")
-    pattern = os.path.expanduser(args.target)
-    target_pdb_files = glob.glob(pattern)
-    target_pdb_files = [os.path.abspath(f) for f in target_pdb_files]
+    # --- Load targets ---
+    print(f"📂 Loading target(s): {args.target}")
+    target_matches = glob.glob(os.path.expanduser(args.target), recursive=True)
+    if not target_matches:
+        print(f"❌ Error: No target files matched: {args.target}")
+        sys.exit(1)
+
+    target_pdb_files = [os.path.abspath(f) for f in target_matches]
     target_pdb_files.sort(key=lambda x: (not os.path.basename(os.path.dirname(x)).startswith("best_pose"), x))
     print("\n".join(f"  - {f}" for f in target_pdb_files))
+
     target_traj = md.load(target_pdb_files)
-    print(target_traj)  # Print summary of the target trajectory
+    print(target_traj)
 
-    # Determine output directory (same as reference PDB?)
-    if args.output == "aligned_model.pdb":
-        output_files = [os.path.join(os.path.dirname(pdb_path), "aligned_model.pdb") for pdb_path in target_pdb_files]
+    n_targets = len(target_pdb_files)
+
+    # --- Output filenames ---
+    # If user did NOT specify -o, we save one aligned file per input.
+    per_input_model_output = (args.output is None)
+
+    if per_input_model_output:
+        output_files = make_output_names(target_pdb_files, "_aligned")
+       #for inp, out in zip(target_pdb_files, output_files):
+       #    print(f"🧬 {os.path.basename(inp)} → {os.path.basename(out)}")
     else:
-        output_files = args.output
+        output_single = os.path.abspath(os.path.expanduser(args.output))
+       #print(f"🧬 Writing ALL aligned models to: {output_single}")
 
-    # Determine oligand directory (same as reference PDB?)
-    if args.oligand == "aligned_ligand.pdb":
-        oligand_files = [os.path.join(os.path.dirname(pdb_path), "aligned_ligand.pdb") for pdb_path in target_pdb_files]
+    # Ligand output: same policy
+    per_input_ligand_output = (args.oligand is None)
+    if per_input_ligand_output:
+        oligand_files = make_output_names(target_pdb_files, "_ligand_aligned")
     else:
-        oligand_files = args.oligand
+        oligand_single = os.path.abspath(os.path.expanduser(args.oligand))
 
+    # --- Identify pocket atoms ---
     print("🔍 Identifying protein backbone pocket atoms from reference...")
-    # Add flag to indicate if ligand exists
     ref_pocket_atoms, has_ligand = identify_pocket_atoms(ref_traj, cutoff=args.cutoff)
     target_pocket_atoms = get_matched_pocket_atoms(ref_traj, target_traj, ref_pocket_atoms)
 
-    if len(ref_pocket_atoms) == len(target_pocket_atoms):
-        print("📐 Aligning target to reference using protein backbone pocket atoms...")
-        target_traj.superpose(ref_traj, atom_indices=target_pocket_atoms, ref_atom_indices=ref_pocket_atoms)
+    if len(ref_pocket_atoms) != len(target_pocket_atoms):
+        print(
+            f"❌ Error: Atom mapping mismatch. ref pocket atoms={len(ref_pocket_atoms)}, "
+            f"target matched atoms={len(target_pocket_atoms)}"
+        )
+        sys.exit(1)
 
-        # Compute RMSD of protein backbone
-        idx = target_traj.topology.select("protein and backbone and not element H")
-        target_protein_traj = target_traj.atom_slice(idx)
-        idx = ref_traj.topology.select("protein and backbone and not element H")
-        ref_protein_traj = ref_traj.atom_slice(idx)
-        rmsd_values = md.rmsd(target_protein_traj, ref_protein_traj)
-        print(f"📊 Pocket-Aligned Protein Backbone RMSD (MDTraj): {rmsd_values} nm")
+    # --- Align ---
+    print("📐 Aligning target to reference using protein backbone pocket atoms...")
+    target_traj.superpose(ref_traj, atom_indices=target_pocket_atoms, ref_atom_indices=ref_pocket_atoms)
 
-        # Compute RMSD of protein pocket
-        target_pocket_traj = target_traj.atom_slice(target_pocket_atoms)
-        ref_pocket_traj = ref_traj.atom_slice(ref_pocket_atoms)
-        rmsd_values = md.rmsd(target_pocket_traj, ref_pocket_traj)
-        print(f"📊 Pocket-Aligned Protein Backbone Pocket RMSD (MDTraj): {rmsd_values} nm")
+    # --- RMSD (protein backbone) ---
+    idx_target = target_traj.topology.select("protein and backbone and not element H")
+    idx_ref = ref_traj.topology.select("protein and backbone and not element H")
+    target_protein_traj = target_traj.atom_slice(idx_target)
+    ref_protein_traj = ref_traj.atom_slice(idx_ref)
+    rmsd_values = md.rmsd(target_protein_traj, ref_protein_traj)
+    print(f"📊 Pocket-Aligned Protein Backbone RMSD (MDTraj): {rmsd_values} nm")
 
-        # Save aligned model structures
-        print(f"💾 Saving aligned model structures")
-        if args.output == "aligned_model.pdb":
-            for i in range(len(target_traj)):
-                print(f" - {output_files[i]}")
-                target_traj[i].save(output_files[i])
+    # --- RMSD (pocket) ---
+    target_pocket_traj = target_traj.atom_slice(target_pocket_atoms)
+    ref_pocket_traj = ref_traj.atom_slice(ref_pocket_atoms)
+    rmsd_values = md.rmsd(target_pocket_traj, ref_pocket_traj)
+    print(f"📊 Pocket-Aligned Protein Backbone Pocket RMSD (MDTraj): {rmsd_values} nm")
+
+    # --- Save aligned models ---
+    print("💾 Saving aligned model structures")
+    if per_input_model_output:
+        for i in range(len(target_traj)):
+            print(f" - {output_files[i]}")
+            target_traj[i].save(output_files[i])
+    else:
+        # IMPORTANT FIX: save ONCE to avoid overwriting; this produces multi-model PDB if multiple frames exist
+        print(f" - {output_single} (contains {len(target_traj)} model(s))")
+        target_traj.save(output_single)
+
+    # --- Save aligned ligands (only if ligand exists in reference) ---
+    if has_ligand:
+        ligand_idx = target_traj.topology.select("not protein and not element H")
+        if len(ligand_idx) == 0:
+            print("ℹ️ Reference had ligand, but target has no ligand atoms — skipping ligand output.")
         else:
-            print(f" - {output_files}")
-            target_traj.save(output_files)
-
-        # Only run ligand saving if ligand is detected
-        if has_ligand:
-            idx = target_traj.topology.select("not protein and not element H")
-            target_ligand_traj = target_traj.atom_slice(idx)
-            print(f"💾 Saving aligned ligand structures")
-            if args.oligand == "aligned_ligand.pdb":
+            target_ligand_traj = target_traj.atom_slice(ligand_idx)
+            print("💾 Saving aligned ligand structures")
+            if per_input_ligand_output:
                 for i in range(len(target_ligand_traj)):
                     print(f" - {oligand_files[i]}")
                     target_ligand_traj[i].save(oligand_files[i])
             else:
-                print(f" - {oligand_files}")
-                target_ligand_traj.save(oligand_files)
-        else:
-            print("ℹ️ No ligand found — skipping ligand output.")
+                print(f" - {oligand_single} (contains {len(target_ligand_traj)} model(s))")
+                target_ligand_traj.save(oligand_single)
+    else:
+        print("ℹ️ No ligand found in reference — skipping ligand output.")
 
-        print("✅ Alignment complete.\n")
+    print("✅ Alignment complete.\n")
+
 
 if __name__ == "__main__":
     main()

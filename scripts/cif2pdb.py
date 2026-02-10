@@ -43,7 +43,7 @@ def main():
         print_help()
 
     pattern = sys.argv[1]
-    cif_files = glob.glob(pattern)
+    cif_files = glob.glob(pattern, recursive=True)
 
     if not cif_files:
         print(f"⚠️ No CIF files found matching pattern: {pattern}")
